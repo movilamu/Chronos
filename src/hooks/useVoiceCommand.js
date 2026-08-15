@@ -1,5 +1,9 @@
-import { useState, useRef, useCallback } from 'react'
+import { useState, useRef, useCallback, useEffect } from 'react'
 import { supabase } from '../lib/supabaseClient'
+import { Capacitor } from '@capacitor/core'
+import { SpeechRecognition } from '@capacitor-community/speech-recognition'
+
+const isNative = Capacitor.isNativePlatform()
 
 export function useVoiceCommand() {
   const [listening, setListening] = useState(false)
@@ -8,15 +12,28 @@ export function useVoiceCommand() {
   const [result, setResult] = useState(null)
   const [error, setError] = useState(null)
   const [pendingContext, setPendingContext] = useState(null)
+  const [nativeSupported, setNativeSupported] = useState(true)
   const recognitionRef = useRef(null)
+  const partialListenerRef = useRef(null)
 
-  const isSupported =
+  const webSupported =
     typeof window !== 'undefined' &&
     (window.SpeechRecognition || window.webkitSpeechRecognition)
 
+  const isSupported = isNative ? nativeSupported : webSupported
+
+  // Check native availability once on mount
+  useEffect(() => {
+    if (!isNative) return
+    SpeechRecognition.available()
+      .then((res) => setNativeSupported(!!res.available))
+      .catch(() => setNativeSupported(false))
+  }, [])
+
   // Speaks text, then reliably fires onDone once speech actually finishes
   // (using utterance.onend, not a guessed timeout - the old timeout-based
-  // approach was the cause of "asks but doesn't listen").
+  // approach was the cause of "asks but doesn't listen"). Web only - native
+  // TTS could be added later via @capacitor-community/text-to-speech if needed.
   const speak = useCallback((text, onDone) => {
     if (typeof window === 'undefined' || !window.speechSynthesis) {
       onDone?.()
@@ -39,16 +56,65 @@ export function useVoiceCommand() {
     window.speechSynthesis.speak(utterance)
   }, [])
 
-  const startListening = useCallback(() => {
-    if (!isSupported) {
+  // ---- NATIVE (Android APK) path ----
+  const startListeningNative = useCallback(async () => {
+    setError(null)
+    setTranscript('')
+    try {
+      const perm = await SpeechRecognition.checkPermissions()
+      if (perm.speechRecognition !== 'granted') {
+        const req = await SpeechRecognition.requestPermissions()
+        if (req.speechRecognition !== 'granted') {
+          setError('Microphone permission was denied. Enable it in phone Settings > Apps > Chronos > Permissions.')
+          return
+        }
+      }
+
+      if (partialListenerRef.current) {
+        partialListenerRef.current.remove()
+        partialListenerRef.current = null
+      }
+
+      partialListenerRef.current = await SpeechRecognition.addListener('partialResults', (data) => {
+        const text = data?.matches?.[0]
+        if (text) setTranscript(text)
+      })
+
+      setListening(true)
+      const result = await SpeechRecognition.start({
+        language: 'en-US',
+        partialResults: true,
+        popup: false,
+      })
+      const finalText = result?.matches?.[0]
+      if (finalText) setTranscript(finalText)
+      setListening(false)
+    } catch (e) {
+      setListening(false)
+      setError(e?.message === 'No matches found' ? "Didn't catch that, try again." : (e?.message || 'Voice recognition failed'))
+    }
+  }, [])
+
+  const stopListeningNative = useCallback(async () => {
+    try {
+      await SpeechRecognition.stop()
+    } catch {
+      // ignore
+    }
+    setListening(false)
+  }, [])
+
+  // ---- WEB path (unchanged behavior) ----
+  const startListeningWeb = useCallback(() => {
+    if (!webSupported) {
       setError('Voice input is not supported in this browser. Try Chrome or Edge.')
       return
     }
     setError(null)
     setTranscript('')
 
-    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition
-    const recognition = new SpeechRecognition()
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition
+    const recognition = new SR()
     recognition.lang = 'en-US'
     recognition.interimResults = true
     recognition.continuous = false
@@ -81,11 +147,20 @@ export function useVoiceCommand() {
         }
       }, 250)
     }
-  }, [isSupported])
+  }, [webSupported])
 
-  const stopListening = useCallback(() => {
+  const stopListeningWeb = useCallback(() => {
     recognitionRef.current?.stop()
     setListening(false)
+  }, [])
+
+  const startListening = isNative ? startListeningNative : startListeningWeb
+  const stopListening = isNative ? stopListeningNative : stopListeningWeb
+
+  useEffect(() => {
+    return () => {
+      if (partialListenerRef.current) partialListenerRef.current.remove()
+    }
   }, [])
 
   const submitCommand = useCallback(async (text, contextOverride, onIntentHandled) => {
