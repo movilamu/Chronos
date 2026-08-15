@@ -1,7 +1,14 @@
 import { createContext, useContext, useEffect, useState } from 'react'
 import { supabase } from '../lib/supabaseClient'
+import { Capacitor } from '@capacitor/core'
+import { Browser } from '@capacitor/browser'
+import { App as CapApp } from '@capacitor/app'
 
 const AuthContext = createContext(null)
+
+const isNative = Capacitor.isNativePlatform()
+// Custom URL scheme registered in AndroidManifest.xml (chronos://login-callback)
+const NATIVE_REDIRECT_URL = 'chronos://login-callback'
 
 export function AuthProvider({ children }) {
   const [session, setSession] = useState(null)
@@ -21,6 +28,48 @@ export function AuthProvider({ children }) {
     return () => listener.subscription.unsubscribe()
   }, [])
 
+  // Native only: catch the OS handing our app the chronos://login-callback
+  // link after Google auth finishes in the in-app browser, close the
+  // browser tab, and let Supabase parse the tokens out of the URL.
+  useEffect(() => {
+    if (!isNative) return
+
+    const listenerPromise = CapApp.addListener('appUrlOpen', async ({ url }) => {
+      if (!url.startsWith(NATIVE_REDIRECT_URL)) return
+      try {
+        await Browser.close()
+      } catch {
+        // browser may already be closed, ignore
+      }
+      try {
+        // Supabase JS v2: parses access_token/refresh_token (or code) from the URL
+        // and establishes the session.
+        const { data, error } = await supabase.auth.exchangeCodeForSession(url)
+        if (!error && data?.session) {
+          setSession(data.session)
+        } else {
+          // Fallback for implicit-flow style tokens in the URL fragment
+          const hash = url.split('#')[1]
+          if (hash) {
+            const params = new URLSearchParams(hash)
+            const access_token = params.get('access_token')
+            const refresh_token = params.get('refresh_token')
+            if (access_token && refresh_token) {
+              const { data: setData } = await supabase.auth.setSession({ access_token, refresh_token })
+              if (setData?.session) setSession(setData.session)
+            }
+          }
+        }
+      } catch (e) {
+        console.error('Auth callback error:', e)
+      }
+    })
+
+    return () => {
+      listenerPromise.then((l) => l.remove())
+    }
+  }, [])
+
   useEffect(() => {
     if (!session?.user) {
       setProfile(null)
@@ -35,6 +84,20 @@ export function AuthProvider({ children }) {
   }, [session])
 
   const signInWithGoogle = async () => {
+    if (isNative) {
+      const { data, error } = await supabase.auth.signInWithOAuth({
+        provider: 'google',
+        options: {
+          redirectTo: NATIVE_REDIRECT_URL,
+          skipBrowserRedirect: true,
+        },
+      })
+      if (!error && data?.url) {
+        await Browser.open({ url: data.url })
+      }
+      return
+    }
+
     await supabase.auth.signInWithOAuth({
       provider: 'google',
       options: { redirectTo: window.location.origin },
