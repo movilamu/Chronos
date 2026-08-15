@@ -1,0 +1,19 @@
+# dependencies
+node_modules/
+
+# build output
+dist/
+dist-ssr/
+
+# env files (secrets)
+.env
+.env.local
+.env.*.local
+
+# supabase local temp/link cache
+supabase/.temp/
+
+# editor/OS
+.DS_Store
+*.log
+.vscode/
